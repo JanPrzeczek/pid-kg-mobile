@@ -151,10 +151,11 @@ if raw_bytes is not None:
         st.write(f"📄 **Počet stran v PDF:** {total_pages} *(pro rychlou odezvu na mobilu vybírej 1–2 strany)*")
 
         page_options = [f"Strana {i + 1}" for i in range(total_pages)]
+        default_page = page_options[8] if total_pages >= 9 else page_options[0]
         selected_labels = st.multiselect(
             "Vyberte strany k náhledu a analýze",
             options=page_options,
-            default=[page_options[0]]
+            default=[default_page]
         )
 
         for label in selected_labels:
@@ -185,7 +186,9 @@ if preview_images:
         with st.status("Zpracovávám výkres (nechte displej telefonu rozsvícený)...", expanded=True) as status:
             try:
                 total_kb = round(sum(len(b) for b in jpeg_payloads) / 1024, 1)
-                st.write(f"1/3 Odesílám optimalizovaná data ({total_kb} KB) do modelu **{model_choice}** (thinking budget: {thinking_budget})...")
+                st.write(f"1/3 Odesílám optimalizovaná data ({total_kb} KB) do modelu **{model_choice}**...")
+                live_counter = st.empty()
+                live_counter.info("⏳ Čekám na první odpověď z Gemini API...")
 
                 image_parts = [
                     types.Part.from_bytes(data=b, mime_type="image/jpeg")
@@ -198,7 +201,7 @@ if preview_images:
                 Neopakuj duplicitní hrany, popisy drž velmi stručné.
                 """
 
-                response = client.models.generate_content(
+                stream = client.models.generate_content_stream(
                     model=model_choice,
                     contents=[*image_parts, prompt],
                     config=types.GenerateContentConfig(
@@ -210,10 +213,25 @@ if preview_images:
                     )
                 )
 
-                elapsed = round(time.time() - t_start, 1)
-                st.write(f"2/3 Odpověď z Gemini přijata za **{elapsed} s**, parsuji strukturu...")
+                chunks = []
+                for chunk in stream:
+                    elapsed_now = round(time.time() - t_start, 1)
+                    if elapsed_now > 120:
+                        raise TimeoutError("Časový limit 120 s vypršel – zkus nastavit Hloubku analýzy na Rychlá (0).")
+                    if getattr(chunk, "text", None):
+                        chunks.append(chunk.text)
+                    total_chars = sum(len(c) for c in chunks)
+                    live_counter.info(f"⚡ Přijímám data z Gemini... {elapsed_now} s | přijato {total_chars} znaků")
 
-                extracted_data = response.parsed or PageExtractionResult.model_validate_json(response.text)
+                full_json = "".join(chunks).strip()
+                if not full_json:
+                    raise ValueError("Model vrátil prázdnou odpověď.")
+
+                elapsed = round(time.time() - t_start, 1)
+                live_counter.empty()
+                st.write(f"2/3 Odpověď přijata za **{elapsed} s** ({len(full_json)} znaků), parsuji strukturu...")
+
+                extracted_data = PageExtractionResult.model_validate_json(full_json)
                 st.write(f"3/3 Vykresluji interaktivní graf ({len(extracted_data.nodes)} prvků, {len(extracted_data.edges)} propojení)...")
                 status.update(label=f"Hotovo za {elapsed} s! Nalezeno {len(extracted_data.nodes)} prvků a {len(extracted_data.edges)} propojení.", state="complete", expanded=False)
 
@@ -241,7 +259,7 @@ if preview_images:
                 with col1:
                     st.download_button(
                         label="Stáhnout JSON",
-                        data=response.text,
+                        data=full_json,
                         file_name="pid_extraction.json",
                         mime="application/json"
                     )
