@@ -55,14 +55,22 @@ model_choice = st.selectbox(
     index=0
 )
 
-uploaded_file = st.file_uploader(
-    "Nahrajte P&ID výkres (PDF, PNG, JPG)",
-    type=["pdf", "png", "jpg", "jpeg"]
+zdroj = st.radio(
+    "Zdroj výkresu",
+    ["📁 Soubor z telefonu", "📷 Vyfotit kamerou"],
+    horizontal=True
 )
 
-if uploaded_file:
-    if uploaded_file.type == "application/pdf":
-        image = convert_pdf_to_image(uploaded_file.read())
+uploaded_file = None
+if zdroj == "📁 Soubor z telefonu":
+    uploaded_file = st.file_uploader("Nahrajte P&ID výkres (PDF, PNG, JPG)")
+else:
+    uploaded_file = st.camera_input("Vyfoťte P&ID schéma")
+
+if uploaded_file is not None:
+    st.info(f"Načten soubor: {uploaded_file.name} ({round(uploaded_file.size / 1024, 1)} KB)")
+    if uploaded_file.type == "application/pdf" or uploaded_file.name.lower().endswith(".pdf"):
+        image = convert_pdf_to_image(uploaded_file.getvalue())
     else:
         image = Image.open(uploaded_file)
 
@@ -117,7 +125,7 @@ if uploaded_file:
                 with col2:
                     cypher_lines = [f"CREATE (:Component {{id: '{n.id}', type: '{n.type}'}});" for n in extracted_data.nodes]
                     cypher_lines += [
-                        f"MATCH (a:Component {{id: '{e.source}'}}), (b:Component {{id: '{e.target}'}}) CREATE (a)-[:{e.relation_type.upper()}]->(b);"
+                        f"MATCH (a:Component {{id: '{e.source}'}}), (b:Component {{id: '{e.target}'}}) CREATE (a)-[:{e.relation_type.upper().replace(' ', '_').replace('-', '_')}]->(b);"
                         for e in extracted_data.edges
                     ]
                     st.download_button(
