@@ -44,23 +44,33 @@ def get_gemini_client():
 
 client = get_gemini_client()
 
+def resize_for_mobile(img: Image.Image, max_px: int = 2400) -> Image.Image:
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    w, h = img.size
+    if max(w, h) > max_px:
+        scale = max_px / float(max(w, h))
+        img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
+    return img
+
 def load_from_url(url: str) -> tuple[bytes, str]:
-    drive_match = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url) or re.search(r"[?&]id=([a-zA-Z0-9_-]+)", url)
+    drive_match = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url, re.IGNORECASE) or re.search(r"[?&]id=([a-zA-Z0-9_-]+)", url, re.IGNORECASE)
     if drive_match:
         file_id = drive_match.group(1)
-        url = f"https://drive.google.com/uc?export=download&id={file_id}"
+        url = f"https://drive.google.com/uc?export=download&confirm=t&id={file_id}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=25) as resp:
+    with urllib.request.urlopen(req, timeout=30) as resp:
         content_type = resp.headers.get_content_type()
         data = resp.read()
-        if "text/html" in content_type.lower():
-            raise ValueError("Odkaz vrátil přihlašovací stránku místo souboru – nastav na Google Disku přístup 'Kdokoliv s odkazem'.")
+        if "text/html" in content_type.lower() and data[:4] != b"%PDF":
+            raise ValueError("Odkaz vrátil HTML stránku místo souboru – ověř na Google Disku nastavení 'Kdokoliv s odkazem'.")
         return data, content_type
 
 model_choice = st.selectbox(
-    "Model Gemini",
-    ["gemini-2.5-flash", "gemini-2.5-pro"],
-    index=0
+    "Model Gemini (lze i ručně přepsat)",
+    ["gemini-3.8-flash", "gemini-3.8-pro"],
+    index=0,
+    accept_new_options=True
 )
 
 zdroj = st.radio(
@@ -103,21 +113,23 @@ if raw_bytes is not None:
     if is_pdf:
         doc = pymupdf.open(stream=raw_bytes, filetype="pdf")
         total_pages = len(doc)
-        st.write(f"📄 **Počet stran v PDF:** {total_pages}")
+        st.write(f"📄 **Počet stran v PDF:** {total_pages} *(vybírej max. 1–4 strany najednou kvůli paměti)*")
 
         page_options = [f"Strana {i + 1}" for i in range(total_pages)]
         selected_labels = st.multiselect(
             "Vyberte strany k náhledu a analýze",
             options=page_options,
-            default=page_options
+            default=[page_options[0]]
         )
 
         for label in selected_labels:
             page_idx = page_options.index(label)
-            pix = doc.load_page(page_idx).get_pixmap(dpi=220)
-            images.append(Image.open(io.BytesIO(pix.tobytes("png"))))
+            pix = doc.load_page(page_idx).get_pixmap(dpi=180)
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            images.append(resize_for_mobile(img))
     else:
-        images = [Image.open(io.BytesIO(raw_bytes))]
+        img = Image.open(io.BytesIO(raw_bytes))
+        images = [resize_for_mobile(img)]
         selected_labels = ["Načtený výkres"]
 
 if images:
