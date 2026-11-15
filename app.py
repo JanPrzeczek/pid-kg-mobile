@@ -40,9 +40,32 @@ def get_gemini_client():
     api_key = st.secrets.get("GEMINI_API_KEY", None)
     if not api_key:
         st.error("Není nastaven GEMINI_API_KEY v Secrets!")
+        return None
     return genai.Client(api_key=api_key)
 
 client = get_gemini_client()
+
+@st.cache_data(ttl=3600)
+def get_available_models(_client) -> list[str]:
+    preferred = ["gemini-3.8-flash", "gemini-3.5-pro", "gemini-3.5-flash", "gemini-2.5-pro"]
+    if _client is None:
+        return ["gemini-3.8-flash"]
+    found = []
+    try:
+        for m in _client.models.list():
+            name = getattr(m, "name", "") or ""
+            short_name = name.replace("models/", "")
+            actions = getattr(m, "supported_actions", None) or []
+            if "gemini" in short_name and not any(x in short_name for x in ("embedding", "imagen", "veo", "aqa")):
+                if not actions or "generateContent" in actions:
+                    found.append(short_name)
+    except Exception:
+        pass
+    if not found:
+        return ["gemini-3.8-flash"]
+    ordered = [p for p in preferred if p in found]
+    others = [f for f in found if f not in ordered]
+    return ordered + others
 
 def resize_for_mobile(img: Image.Image, max_px: int = 2400) -> Image.Image:
     if img.mode != "RGB":
@@ -66,9 +89,10 @@ def load_from_url(url: str) -> tuple[bytes, str]:
             raise ValueError("Odkaz vrátil HTML stránku místo souboru – ověř na Google Disku nastavení 'Kdokoliv s odkazem'.")
         return data, content_type
 
+available_models = get_available_models(client)
 model_choice = st.selectbox(
-    "Model Gemini (lze i ručně přepsat)",
-    ["gemini-3.8-flash", "gemini-3.8-pro"],
+    "Model Gemini (načteno z tvého API klíče)",
+    available_models,
     index=0,
     accept_new_options=True
 )
@@ -142,7 +166,7 @@ if images:
                 st.image(img, caption=lbl)
 
     if st.button(f"🔍 Analyzovat ({len(images)} {'stranu' if len(images) == 1 else 'strany/stran'}) a vygenerovat graf", type="primary"):
-        with st.spinner("Gemini čte technické schéma a sestavuje graf prvků..."):
+        with st.spinner(f"Model {model_choice} čte technické schéma a sestavuje graf prvků..."):
             try:
                 prompt = """
                 Jsi expert na P&ID schémata. Zanalyzuj všechny přiložené strany výkresu podle normy ISA-5.1.
