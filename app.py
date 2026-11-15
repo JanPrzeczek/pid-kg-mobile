@@ -1,5 +1,6 @@
 import io
 import re
+import time
 import urllib.request
 import pymupdf
 import streamlit as st
@@ -14,12 +15,12 @@ class PIDNode(BaseModel):
     id: str = Field(description="Přesný TAG kód prvku dle ISA-5.1, např. PT-101, V-102, P-101")
     category: str = Field(description="Kategorie prvku: 'equipment', 'valve', 'instrument' nebo 'other'")
     type: str = Field(description="Typ zařízení nebo přístroje, např. Pressure Transmitter, Valve, Tank")
-    description: str = Field(description="Stručný popis funkce prvku ve schématu")
+    description: str = Field(description="Stručný popis funkce prvku (max 6 slov)")
 
 class PIDEdge(BaseModel):
     source: str = Field(description="ID (TAG) zdrojového prvku")
     target: str = Field(description="ID (TAG) cílového prvku")
-    relation_type: str = Field(description="Typ propojení, např. 'process_pipe' nebo 'signal_line'")
+    relation_type: str = Field(description="Typ propojení: 'process_pipe' nebo 'signal_line'")
 
 class PageExtractionResult(BaseModel):
     nodes: list[PIDNode]
@@ -47,7 +48,7 @@ client = get_gemini_client()
 
 @st.cache_data(ttl=3600)
 def get_available_models(_client) -> list[str]:
-    preferred = ["gemini-3.8-flash", "gemini-3.5-pro", "gemini-3.5-flash", "gemini-2.5-pro"]
+    preferred = ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.5-pro"]
     if _client is None:
         return ["gemini-3.8-flash"]
     found = []
@@ -67,14 +68,16 @@ def get_available_models(_client) -> list[str]:
     others = [f for f in found if f not in ordered]
     return ordered + others
 
-def resize_for_mobile(img: Image.Image, max_px: int = 2400) -> Image.Image:
+def prepare_image_jpeg(img: Image.Image, max_px: int = 2000) -> tuple[Image.Image, bytes]:
     if img.mode != "RGB":
         img = img.convert("RGB")
     w, h = img.size
     if max(w, h) > max_px:
         scale = max_px / float(max(w, h))
         img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
-    return img
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85, optimize=True)
+    return img, buf.getvalue()
 
 def load_from_url(url: str) -> tuple[bytes, str]:
     drive_match = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url, re.IGNORECASE) or re.search(r"[?&]id=([a-zA-Z0-9_-]+)", url, re.IGNORECASE)
@@ -91,10 +94,17 @@ def load_from_url(url: str) -> tuple[bytes, str]:
 
 available_models = get_available_models(client)
 model_choice = st.selectbox(
-    "Model Gemini (načteno z tvého API klíče)",
+    "Model Gemini",
     available_models,
     index=0,
     accept_new_options=True
+)
+
+thinking_budget = st.select_slider(
+    "Hloubka analýzy (Thinking budget)",
+    options=[0, 1500, 4000],
+    value=1500,
+    format_func=lambda x: "Rychlá (0)" if x == 0 else ("Vyvážená (1500)" if x == 1500 else "Hloubková (4000)")
 )
 
 zdroj = st.radio(
@@ -130,14 +140,15 @@ else:
         is_pdf = uploaded_file.type == "application/pdf" or uploaded_file.name.lower().endswith(".pdf")
         st.info(f"Načten soubor: {uploaded_file.name} ({round(len(raw_bytes) / 1024, 1)} KB)")
 
-images = []
+preview_images = []
+jpeg_payloads = []
 selected_labels = []
 
 if raw_bytes is not None:
     if is_pdf:
         doc = pymupdf.open(stream=raw_bytes, filetype="pdf")
         total_pages = len(doc)
-        st.write(f"📄 **Počet stran v PDF:** {total_pages} *(vybírej max. 1–4 strany najednou kvůli paměti)*")
+        st.write(f"📄 **Počet stran v PDF:** {total_pages} *(pro rychlou odezvu na mobilu vybírej 1–2 strany)*")
 
         page_options = [f"Strana {i + 1}" for i in range(total_pages)]
         selected_labels = st.multiselect(
@@ -148,47 +159,66 @@ if raw_bytes is not None:
 
         for label in selected_labels:
             page_idx = page_options.index(label)
-            pix = doc.load_page(page_idx).get_pixmap(dpi=180)
-            img = Image.open(io.BytesIO(pix.tobytes("png")))
-            images.append(resize_for_mobile(img))
+            pix = doc.load_page(page_idx).get_pixmap(dpi=160)
+            raw_img = Image.open(io.BytesIO(pix.tobytes("png")))
+            prev_img, jpg_bytes = prepare_image_jpeg(raw_img)
+            preview_images.append(prev_img)
+            jpeg_payloads.append(jpg_bytes)
     else:
-        img = Image.open(io.BytesIO(raw_bytes))
-        images = [resize_for_mobile(img)]
+        raw_img = Image.open(io.BytesIO(raw_bytes))
+        prev_img, jpg_bytes = prepare_image_jpeg(raw_img)
+        preview_images = [prev_img]
+        jpeg_payloads = [jpg_bytes]
         selected_labels = ["Načtený výkres"]
 
-if images:
-    if len(images) == 1:
-        st.image(images[0], caption=selected_labels[0])
+if preview_images:
+    if len(preview_images) == 1:
+        st.image(preview_images[0], caption=selected_labels[0])
     else:
         tabs = st.tabs(selected_labels)
-        for tab, img, lbl in zip(tabs, images, selected_labels):
+        for tab, img, lbl in zip(tabs, preview_images, selected_labels):
             with tab:
                 st.image(img, caption=lbl)
 
-    if st.button(f"🔍 Analyzovat ({len(images)} {'stranu' if len(images) == 1 else 'strany/stran'}) a vygenerovat graf", type="primary"):
-        with st.spinner(f"Model {model_choice} čte technické schéma a sestavuje graf prvků..."):
+    if st.button(f"🔍 Analyzovat ({len(preview_images)} {'stranu' if len(preview_images) == 1 else 'strany/stran'}) a vygenerovat graf", type="primary"):
+        t_start = time.time()
+        with st.status("Zpracovávám výkres (nechte displej telefonu rozsvícený)...", expanded=True) as status:
             try:
+                total_kb = round(sum(len(b) for b in jpeg_payloads) / 1024, 1)
+                st.write(f"1/3 Odesílám optimalizovaná data ({total_kb} KB) do modelu **{model_choice}** (thinking budget: {thinking_budget})...")
+
+                image_parts = [
+                    types.Part.from_bytes(data=b, mime_type="image/jpeg")
+                    for b in jpeg_payloads
+                ]
+
                 prompt = """
-                Jsi expert na P&ID schémata. Zanalyzuj všechny přiložené strany výkresu podle normy ISA-5.1.
-                Extrahuj všechny uzly (Equipment, Valves, Instruments) a jejich propojení (Piping, Signal lines)
-                napříč všemi stranami do jednoho sjednoceného znalostního grafu (propoj i návaznosti mezi listy / Off-Page Connectors).
-                U každého prvku uveď přesný TAG kód (např. PT-101, V-102, T-100).
+                Jsi expert na P&ID schémata. Zanalyzuj výkres podle normy ISA-5.1.
+                Extrahuj hlavní technologické uzly (Equipment, Valves, Instruments s TAG kódem) a jejich přímá propojení (Piping, Signal lines).
+                Neopakuj duplicitní hrany, popisy drž velmi stručné.
                 """
 
                 response = client.models.generate_content(
                     model=model_choice,
-                    contents=[*images, prompt],
+                    contents=[*image_parts, prompt],
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
                         response_schema=PageExtractionResult,
                         temperature=0.1,
+                        max_output_tokens=16384,
+                        thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget),
                     )
                 )
 
+                elapsed = round(time.time() - t_start, 1)
+                st.write(f"2/3 Odpověď z Gemini přijata za **{elapsed} s**, parsuji strukturu...")
+
                 extracted_data = response.parsed or PageExtractionResult.model_validate_json(response.text)
-                st.success(f"Extrakce dokončena! Nalezeno {len(extracted_data.nodes)} prvků a {len(extracted_data.edges)} propojení.")
+                st.write(f"3/3 Vykresluji interaktivní graf ({len(extracted_data.nodes)} prvků, {len(extracted_data.edges)} propojení)...")
+                status.update(label=f"Hotovo za {elapsed} s! Nalezeno {len(extracted_data.nodes)} prvků a {len(extracted_data.edges)} propojení.", state="complete", expanded=False)
 
                 net = Network(height="500px", width="100%", directed=True, bgcolor="#1e1e1e", font_color="white")
+                net.barnes_hut(gravity=-3000, central_gravity=0.3, spring_length=120)
                 known_ids = set()
 
                 for node in extracted_data.nodes:
@@ -203,7 +233,6 @@ if images:
                             net.add_node(endpoint, label=endpoint, title="Odkazovaný prvek / Off-page connector", color="#9E9E9E")
                     net.add_edge(edge.source, edge.target, label=edge.relation_type)
 
-                net.toggle_physics(True)
                 components.html(net.generate_html(), height=520, scrolling=False)
 
                 st.subheader("📥 Exportovat výsledky")
@@ -236,6 +265,7 @@ if images:
                     )
 
             except Exception as e:
+                status.update(label="Chyba při zpracování", state="error", expanded=True)
                 st.error(f"Chyba při zpracování: {str(e)}")
 
 # --- KONEC SOUBORU ---
