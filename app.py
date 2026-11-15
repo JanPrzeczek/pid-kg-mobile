@@ -1,8 +1,8 @@
 import io
 import re
 import time
+import threading
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 import pymupdf
 import streamlit as st
 from PIL import Image
@@ -16,7 +16,7 @@ class PIDNode(BaseModel):
     id: str = Field(description="Přesný TAG kód prvku dle ISA-5.1, např. PT-101, V-102, P-101")
     category: str = Field(description="Kategorie prvku: 'equipment', 'valve', 'instrument' nebo 'other'")
     type: str = Field(description="Typ zařízení nebo přístroje, např. Pressure Transmitter, Valve, Tank")
-    description: str = Field(description="Stručný popis funkce prvku (max 6 slov)")
+    description: str = Field(description="Stručný popis funkce prvku (max 5 slov)")
 
 class PIDEdge(BaseModel):
     source: str = Field(description="ID (TAG) zdrojového prvku")
@@ -69,7 +69,7 @@ def get_available_models(_client) -> list[str]:
     others = [f for f in found if f not in ordered]
     return ordered + others
 
-def prepare_image_jpeg(img: Image.Image, max_px: int = 1800) -> tuple[Image.Image, bytes]:
+def prepare_image_jpeg(img: Image.Image, max_px: int = 1400) -> tuple[Image.Image, bytes]:
     if img.mode != "RGB":
         img = img.convert("RGB")
     w, h = img.size
@@ -77,7 +77,7 @@ def prepare_image_jpeg(img: Image.Image, max_px: int = 1800) -> tuple[Image.Imag
         scale = max_px / float(max(w, h))
         img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85, optimize=True)
+    img.save(buf, format="JPEG", quality=80, optimize=True)
     return img, buf.getvalue()
 
 def load_from_url(url: str) -> tuple[bytes, str]:
@@ -93,36 +93,67 @@ def load_from_url(url: str) -> tuple[bytes, str]:
             raise ValueError("Odkaz vrátil HTML stránku místo souboru – ověř na Google Disku nastavení 'Kdokoliv s odkazem'.")
         return data, content_type
 
-def call_gemini_worker(api_client, model_name: str, jpg_list: list[bytes], prompt_text: str, fast_mode: bool) -> str:
-    image_parts = [
-        types.Part.from_bytes(data=b, mime_type="image/jpeg")
-        for b in jpg_list
-    ]
-    cfg_kwargs = {
-        "response_mime_type": "application/json",
-        "temperature": 0.1,
-        "max_output_tokens": 16384,
-    }
-    if fast_mode:
-        cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+def build_thinking_config(fast_mode: bool):
+    candidates = (
+        [{"thinking_level": "MINIMAL"}, {"thinking_level": "LOW"}, {"thinking_budget": 0}]
+        if fast_mode
+        else [{"thinking_level": "MEDIUM"}, {"thinking_budget": 1024}]
+    )
+    for kw in candidates:
+        try:
+            return types.ThinkingConfig(**kw)
+        except Exception:
+            continue
+    return None
 
+def stream_gemini_worker(api_client, model_name: str, jpg_list: list[bytes], prompt_text: str, fast_mode: bool, state: dict):
     try:
-        resp = api_client.models.generate_content(
-            model=model_name,
-            contents=[*image_parts, prompt_text],
-            config=types.GenerateContentConfig(**cfg_kwargs),
-        )
-    except Exception:
-        if "thinking_config" in cfg_kwargs:
-            del cfg_kwargs["thinking_config"]
-            resp = api_client.models.generate_content(
+        image_parts = [
+            types.Part.from_bytes(data=b, mime_type="image/jpeg")
+            for b in jpg_list
+        ]
+        cfg_kwargs = {
+            "response_mime_type": "application/json",
+            "temperature": 0.1,
+            "max_output_tokens": 4096 if fast_mode else 8192,
+        }
+        t_cfg = build_thinking_config(fast_mode)
+        if t_cfg is not None:
+            cfg_kwargs["thinking_config"] = t_cfg
+
+        try:
+            stream = api_client.models.generate_content_stream(
                 model=model_name,
                 contents=[*image_parts, prompt_text],
                 config=types.GenerateContentConfig(**cfg_kwargs),
             )
-        else:
-            raise
-    return resp.text or ""
+            chunks = []
+            for chunk in stream:
+                if getattr(chunk, "text", None):
+                    chunks.append(chunk.text)
+                    state["chars"] = sum(len(c) for c in chunks)
+        except Exception as first_err:
+            if "thinking_config" in cfg_kwargs:
+                state["note"] = "Přepínám na výchozí konfiguraci modelu..."
+                del cfg_kwargs["thinking_config"]
+                stream = api_client.models.generate_content_stream(
+                    model=model_name,
+                    contents=[*image_parts, prompt_text],
+                    config=types.GenerateContentConfig(**cfg_kwargs),
+                )
+                chunks = []
+                for chunk in stream:
+                    if getattr(chunk, "text", None):
+                        chunks.append(chunk.text)
+                        state["chars"] = sum(len(c) for c in chunks)
+            else:
+                raise first_err
+
+        state["text"] = "".join(chunks)
+    except Exception as exc:
+        state["error"] = str(exc)
+    finally:
+        state["done"] = True
 
 available_models = get_available_models(client)
 model_choice = st.selectbox(
@@ -134,7 +165,7 @@ model_choice = st.selectbox(
 
 mode_choice = st.radio(
     "Režim zpracování",
-    ["⚡ Rychlý (do 20 s)", "🧠 Standardní (s úvahou modelu)"],
+    ["⚡ Rychlý (hlavní TAGy, do 25 s)", "🧠 Standardní (detailnější)"],
     index=0,
     horizontal=True
 )
@@ -175,6 +206,7 @@ else:
 preview_images = []
 jpeg_payloads = []
 selected_labels = []
+extracted_text_hints = []
 
 if raw_bytes is not None:
     if is_pdf:
@@ -192,7 +224,11 @@ if raw_bytes is not None:
 
         for label in selected_labels:
             page_idx = page_options.index(label)
-            pix = doc.load_page(page_idx).get_pixmap(dpi=150)
+            page = doc.load_page(page_idx)
+            page_txt = " ".join(page.get_text("text").split())
+            if page_txt:
+                extracted_text_hints.append(f"[{label}]: {page_txt[:2200]}")
+            pix = page.get_pixmap(dpi=130)
             raw_img = Image.open(io.BytesIO(pix.tobytes("png")))
             prev_img, jpg_bytes = prepare_image_jpeg(raw_img)
             preview_images.append(prev_img)
@@ -221,50 +257,58 @@ if preview_images:
                 st.write(f"1/3 Odesílám data ({total_kb} KB) do **{model_choice}**...")
                 timer_box = st.empty()
 
-                prompt = """
-                Jsi expert na P&ID schémata. Zanalyzuj přiložený výkres podle normy ISA-5.1.
-                Extrahuj hlavní technologické uzly (Equipment, Valves, Instruments s TAG kódem) a jejich přímá propojení (Piping, Signal lines).
-                Vrať VÝHRADNĚ validní JSON přesně v této struktuře (bez markdown obalu):
-                {
+                hints_block = ""
+                if extracted_text_hints:
+                    hints_block = "\nTextová vrstva z PDF (nápověda TAG kódů):\n" + "\n".join(extracted_text_hints)
+
+                prompt = f"""
+                Jsi expert na P&ID schémata dle normy ISA-5.1.
+                Zanalyzuj přiložený výkres a extrahuj MAXIMÁLNĚ 40 nejdůležitějších uzlů s TAG kódem (hlavní technologie, čerpadla, nádrže, regulační ventily, měřicí přístroje) a jejich přímá propojení (max 50 hran).
+                Ignoruj drobné ruční odvzdušňovací/vypouštěcí ventily bez TAGu a texty v razítku výkresu.
+                Vrať VÝHRADNĚ validní JSON v této struktuře:
+                {{
                   "nodes": [
-                    {"id": "PT-101", "category": "instrument", "type": "Pressure Transmitter", "description": "Měření tlaku na výtlaku"}
+                    {{"id": "PT-101", "category": "instrument", "type": "Pressure Transmitter", "description": "Měření tlaku"}}
                   ],
                   "edges": [
-                    {"source": "P-101", "target": "PT-101", "relation_type": "process_pipe"}
+                    {{"source": "P-101", "target": "PT-101", "relation_type": "process_pipe"}}
                   ]
-                }
+                }}
                 Hodnota category smí být jen: "equipment", "valve", "instrument" nebo "other".
-                Neopakuj duplicitní hrany, popisy drž stručné (max 6 slov).
+                Popisy drž velmi stručné (max 4 slova).{hints_block}
                 """
 
                 fast_mode = mode_choice.startswith("⚡")
-                max_wait = 75
+                max_wait = 110
+                worker_state = {"chars": 0, "note": "", "text": "", "error": None, "done": False}
 
-                with ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(
-                        call_gemini_worker,
-                        client,
-                        model_choice,
-                        jpeg_payloads,
-                        prompt,
-                        fast_mode,
+                thread = threading.Thread(
+                    target=stream_gemini_worker,
+                    args=(client, model_choice, jpeg_payloads, prompt, fast_mode, worker_state),
+                    daemon=True,
+                )
+                thread.start()
+
+                while not worker_state["done"]:
+                    elapsed_now = round(time.time() - t_start, 1)
+                    if elapsed_now > max_wait:
+                        raise TimeoutError(f"API neodpovědělo do {max_wait} s.")
+                    extra = f" | {worker_state['note']}" if worker_state["note"] else ""
+                    timer_box.info(
+                        f"⏳ Gemini zpracovává... {elapsed_now} s / {max_wait} s | přijato {worker_state['chars']} znaků{extra}"
                     )
-                    while not future.done():
-                        elapsed_now = round(time.time() - t_start, 1)
-                        if elapsed_now > max_wait:
-                            raise TimeoutError(f"API neodpovědělo do {max_wait} s. Zkus přepnout Režim zpracování na '⚡ Rychlý'.")
-                        timer_box.info(f"⏳ Gemini zpracovává výkres... {elapsed_now} s / {max_wait} s")
-                        time.sleep(0.5)
+                    time.sleep(0.4)
 
-                    raw_text = future.result()
+                if worker_state["error"]:
+                    raise RuntimeError(worker_state["error"])
 
-                clean_json = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text.strip())
+                clean_json = re.sub(r"^```(?:json)?\s*|\s*```$", "", worker_state["text"].strip())
                 if not clean_json:
                     raise ValueError("Model vrátil prázdnou odpověď.")
 
                 elapsed = round(time.time() - t_start, 1)
                 timer_box.empty()
-                st.write(f"2/3 Odpověď přijata za **{elapsed} s**, ověřuji JSON...")
+                st.write(f"2/3 Odpověď přijata za **{elapsed} s** ({len(clean_json)} znaků), ověřuji JSON...")
 
                 extracted_data = PageExtractionResult.model_validate_json(clean_json)
                 st.write(f"3/3 Vykresluji graf ({len(extracted_data.nodes)} prvků, {len(extracted_data.edges)} propojení)...")
@@ -317,9 +361,6 @@ if preview_images:
                         mime="text/plain"
                     )
 
-            except FuturesTimeoutError:
-                status.update(label="Vypršel časový limit API", state="error", expanded=True)
-                st.error("Vypršel časový limit 75 s při čekání na odpověď z Gemini API.")
             except Exception as e:
                 status.update(label="Chyba při zpracování", state="error", expanded=True)
                 st.error(f"Chyba při zpracování: {str(e)}")
