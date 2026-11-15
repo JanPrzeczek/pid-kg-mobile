@@ -1,4 +1,6 @@
 import io
+import re
+import urllib.request
 import pymupdf
 import streamlit as st
 from PIL import Image
@@ -8,7 +10,6 @@ from google.genai import types
 from pyvis.network import Network
 import streamlit.components.v1 as components
 
-# Definice datového schématu pro strukturovaný výstup z Gemini
 class PIDNode(BaseModel):
     id: str = Field(description="Přesný TAG kód prvku dle ISA-5.1, např. PT-101, V-102, P-101")
     category: str = Field(description="Kategorie prvku: 'equipment', 'valve', 'instrument' nebo 'other'")
@@ -49,6 +50,19 @@ def convert_pdf_to_image(pdf_bytes: bytes) -> Image.Image:
     pix = page.get_pixmap(dpi=300)
     return Image.open(io.BytesIO(pix.tobytes("png")))
 
+def load_from_url(url: str) -> tuple[bytes, str]:
+    drive_match = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url) or re.search(r"[?&]id=([a-zA-Z0-9_-]+)", url)
+    if drive_match:
+        file_id = drive_match.group(1)
+        url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        content_type = resp.headers.get_content_type()
+        data = resp.read()
+        if "text/html" in content_type.lower():
+            raise ValueError("Odkaz vrátil přihlašovací stránku místo souboru – nastav na Google Disku přístup 'Kdokoliv s odkazem'.")
+        return data, content_type
+
 model_choice = st.selectbox(
     "Model Gemini",
     ["gemini-2.5-flash", "gemini-2.5-pro"],
@@ -57,26 +71,45 @@ model_choice = st.selectbox(
 
 zdroj = st.radio(
     "Zdroj výkresu",
-    ["📁 Soubor z telefonu", "📷 Vyfotit kamerou"],
-    horizontal=True
+    ["🔗 Odkaz (Google Disk / URL)", "📷 Vyfotit kamerou", "📁 Soubor z telefonu"],
+    horizontal=False
 )
 
-uploaded_file = None
-if zdroj == "📁 Soubor z telefonu":
-    uploaded_file = st.file_uploader("Nahrajte P&ID výkres (PDF, PNG, JPG)")
+image = None
+
+if zdroj == "🔗 Odkaz (Google Disk / URL)":
+    file_url = st.text_input("Vložte sdílený odkaz na JPG/PNG/PDF")
+    if file_url:
+        try:
+            with st.spinner("Stahuji výkres z odkazu..."):
+                raw_bytes, content_type = load_from_url(file_url.strip())
+                if "pdf" in content_type.lower() or raw_bytes[:4] == b"%PDF":
+                    image = convert_pdf_to_image(raw_bytes)
+                else:
+                    image = Image.open(io.BytesIO(raw_bytes))
+                st.info(f"Výkres úspěšně stažen ({round(len(raw_bytes) / 1024, 1)} KB)")
+        except Exception as e:
+            st.error(f"Nepodařilo se načíst soubor z odkazu: {e}")
+
+elif zdroj == "📷 Vyfotit kamerou":
+    cam_file = st.camera_input("Vyfoťte P&ID schéma")
+    if cam_file is not None:
+        st.info(f"Načten snímek z kamery ({round(cam_file.size / 1024, 1)} KB)")
+        image = Image.open(cam_file)
+
 else:
-    uploaded_file = st.camera_input("Vyfoťte P&ID schéma")
+    uploaded_file = st.file_uploader("Nahrajte P&ID výkres (PDF, PNG, JPG)")
+    if uploaded_file is not None:
+        st.info(f"Načten soubor: {uploaded_file.name} ({round(uploaded_file.size / 1024, 1)} KB)")
+        if uploaded_file.type == "application/pdf" or uploaded_file.name.lower().endswith(".pdf"):
+            image = convert_pdf_to_image(uploaded_file.getvalue())
+        else:
+            image = Image.open(uploaded_file)
 
-if uploaded_file is not None:
-    st.info(f"Načten soubor: {uploaded_file.name} ({round(uploaded_file.size / 1024, 1)} KB)")
-    if uploaded_file.type == "application/pdf" or uploaded_file.name.lower().endswith(".pdf"):
-        image = convert_pdf_to_image(uploaded_file.getvalue())
-    else:
-        image = Image.open(uploaded_file)
+if image is not None:
+    st.image(image, caption="Načtený výkres")
 
-    st.image(image, caption="Načtený výkres", use_container_width=True)
-
-    if st.button("🔍 Analyzovat a vygenerovat graf", type="primary", use_container_width=True):
+    if st.button("🔍 Analyzovat a vygenerovat graf", type="primary"):
         with st.spinner("Gemini čte technické schéma a sestavuje graf prvků..."):
             try:
                 prompt = """
@@ -118,8 +151,7 @@ if uploaded_file is not None:
                         label="Stáhnout JSON",
                         data=response.text,
                         file_name="pid_extraction.json",
-                        mime="application/json",
-                        use_container_width=True
+                        mime="application/json"
                     )
 
                 with col2:
@@ -132,8 +164,7 @@ if uploaded_file is not None:
                         label="Stáhnout Cypher",
                         data="\n".join(cypher_lines),
                         file_name="pid_graph.cypher",
-                        mime="text/plain",
-                        use_container_width=True
+                        mime="text/plain"
                     )
 
             except Exception as e:
