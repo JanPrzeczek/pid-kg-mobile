@@ -185,4 +185,21 @@ if images:
                     cypher_lines = []
                     for n in extracted_data.nodes:
                         n_id = n.id.replace("'", "")
-                        n_type = n
+                        n_type = n.type.replace("'", "")
+                        cypher_lines.append(f"CREATE (:Component {{id: '{n_id}', type: '{n_type}'}});")
+                    for e in extracted_data.edges:
+                        src = e.source.replace("'", "")
+                        tgt = e.target.replace("'", "")
+                        rel = re.sub(r"[^A-Za-z0-9_]", "_", e.relation_type.upper()) or "CONNECTED_TO"
+                        cypher_lines.append(f"MATCH (a:Component {{id: '{src}'}}), (b:Component {{id: '{tgt}'}}) CREATE (a)-[:{rel}]->(b);")
+                    st.download_button(
+                        label="Stáhnout Cypher",
+                        data="\n".join(cypher_lines),
+                        file_name="pid_graph.cypher",
+                        mime="text/plain"
+                    )
+
+            except Exception as e:
+                st.error(f"Chyba při zpracování: {str(e)}")
+
+# --- KONEC SOUBORU ---
