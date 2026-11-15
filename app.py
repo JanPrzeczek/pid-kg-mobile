@@ -30,7 +30,7 @@ class PIDNode(BaseModel):
     page: int = Field(default=1, description="Číslo vybrané strany (1, 2, ...)")
     box_2d: list[int] = Field(
         default_factory=list,
-        description="Souřadnice symbolu/bubliny na celém listu [ymin, xmin, ymax, xmax] v rozsahu 0 až 1000"
+        description="Souřadnice symbolu/bubliny na přiloženém obrázku [ymin, xmin, ymax, xmax] v rozsahu 0 až 1000"
     )
 
 
@@ -138,7 +138,7 @@ def load_from_url(url: str) -> tuple[bytes, str]:
         return data, content_type
 
 
-def encode_jpeg_bytes(img: Image.Image, max_px: int = 1600, quality: int = 82) -> bytes:
+def encode_jpeg_bytes(img: Image.Image, max_px: int = 1500, quality: int = 82) -> bytes:
     if img.mode != "RGB":
         img = img.convert("RGB")
     w, h = img.size
@@ -150,33 +150,234 @@ def encode_jpeg_bytes(img: Image.Image, max_px: int = 1600, quality: int = 82) -
     return buf.getvalue()
 
 
-def build_image_parts_with_tiles(img: Image.Image, page_num: int, tile_mode: bool) -> list[types.Part]:
-    """Vytvoří celek listu a při dlaždicovém režimu i 4 překrývající se výřezy (2x2) s popisem souřadnic."""
-    parts: list[types.Part] = []
-    overview_bytes = encode_jpeg_bytes(img, max_px=1500, quality=80)
-    parts.append(types.Part.from_text(text=f"[Strana {page_num} – CELKOVÝ PŘEHLED LISTU, souřadnice 0..1000]"))
-    parts.append(types.Part.from_bytes(data=overview_bytes, mime_type="image/jpeg"))
+def create_tile_jobs(img: Image.Image, page_num: int, tile_mode: bool) -> list[dict]:
+    """Vytvoří seznam samostatných úloh (každá má 1 obrázek + přesné normované okno na listu)."""
+    if not tile_mode:
+        return [{
+            "label": f"Strana {page_num} (celek)",
+            "page": page_num,
+            "rect": (0.0, 0.0, 1.0, 1.0),
+            "jpeg": encode_jpeg_bytes(img, max_px=1550, quality=82),
+        }]
 
-    if tile_mode:
-        w, h = img.size
-        # 4 překrývající se dlaždice (55% šířky/výšky), aby žádný symbol na hraně nezmizel
-        tiles_spec = [
-            ("Dlaždice 1 (Levý horní kvadrant: x=0..550, y=0..550)", (0, 0, int(w * 0.55), int(h * 0.55))),
-            ("Dlaždice 2 (Pravý horní kvadrant: x=450..1000, y=0..550)", (int(w * 0.45), 0, w, int(h * 0.55))),
-            ("Dlaždice 3 (Levý dolní kvadrant: x=0..550, y=450..1000)", (0, int(h * 0.45), int(w * 0.55), h)),
-            ("Dlaždice 4 (Pravý dolní kvadrant: x=450..1000, y=450..1000)", (int(w * 0.45), int(h * 0.45), w, h)),
-        ]
-        for desc, crop_box in tiles_spec:
-            crop_img = img.crop(crop_box)
-            crop_bytes = encode_jpeg_bytes(crop_img, max_px=1250, quality=80)
-            parts.append(types.Part.from_text(text=f"[Strana {page_num} – {desc} – souřadnice box_2d ale vztaženy k CELÉMU listu 0..1000]"))
-            parts.append(types.Part.from_bytes(data=crop_bytes, mime_type="image/jpeg"))
-
-    return parts
+    w, h = img.size
+    # 4 překrývající se kvadranty (15% překryv uprostřed, aby se neztratily hrany přes střed)
+    quads = [
+        ("Dlaždice 1/4 (levá horní)", (0.0, 0.0, 0.575, 0.575)),
+        ("Dlaždice 2/4 (pravá horní)", (0.425, 0.0, 1.0, 0.575)),
+        ("Dlaždice 3/4 (levá dolní)", (0.0, 0.425, 0.575, 1.0)),
+        ("Dlaždice 4/4 (pravá dolní)", (0.425, 0.425, 1.0, 1.0)),
+    ]
+    jobs = []
+    for lbl, (x0, y0, x1, y1) in quads:
+        crop_box = (int(w * x0), int(h * y0), int(w * x1), int(h * y1))
+        crop_img = img.crop(crop_box)
+        jobs.append({
+            "label": f"Strana {page_num} – {lbl}",
+            "page": page_num,
+            "rect": (x0, y0, x1, y1),
+            "jpeg": encode_jpeg_bytes(crop_img, max_px=1250, quality=82),
+        })
+    return jobs
 
 
 # ==============================================================================
-# 4. ANALÝZA GRAFU (CONTROL LOOPS, QA CHYBY, DETERMINISTICKÉ TRASOVÁNÍ)
+# 4. VOLÁNÍ GEMINI S TVRDÝM ČASOVAČEM MIMO STREAM + SLOUČENÍ DLAŽDIC
+# ==============================================================================
+def _single_attempt_worker(api_client, model_name: str, jpg_bytes: bytes, prompt_text: str, out_state: dict):
+    try:
+        img_part = types.Part.from_bytes(data=jpg_bytes, mime_type="image/jpeg")
+        cfg_kwargs = {
+            "response_mime_type": "application/json",
+            "temperature": 0.1,
+            "max_output_tokens": 5120,
+        }
+        try:
+            cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level="LOW")
+        except Exception:
+            pass
+
+        try:
+            stream = api_client.models.generate_content_stream(
+                model=model_name,
+                contents=[img_part, prompt_text],
+                config=types.GenerateContentConfig(**cfg_kwargs),
+            )
+            chunks = []
+            for chunk in stream:
+                if getattr(chunk, "text", None):
+                    chunks.append(chunk.text)
+                    out_state["chars"] = sum(len(c) for c in chunks)
+        except Exception as first_err:
+            if "thinking" in str(first_err).lower() and "thinking_config" in cfg_kwargs:
+                del cfg_kwargs["thinking_config"]
+                stream = api_client.models.generate_content_stream(
+                    model=model_name,
+                    contents=[img_part, prompt_text],
+                    config=types.GenerateContentConfig(**cfg_kwargs),
+                )
+                chunks = []
+                for chunk in stream:
+                    if getattr(chunk, "text", None):
+                        chunks.append(chunk.text)
+                        out_state["chars"] = sum(len(c) for c in chunks)
+            else:
+                raise first_err
+
+        out_state["text"] = "".join(chunks).strip()
+    except Exception as exc:
+        out_state["error"] = str(exc)
+    finally:
+        out_state["done"] = True
+
+
+def run_tile_with_hard_timeout(
+    api_client,
+    models_to_try: list[str],
+    job: dict,
+    text_hint: str,
+    status_placeholder,
+    job_idx: int,
+    total_jobs: int,
+    per_model_timeout: float = 32.0,
+) -> tuple[PageExtractionResult, str]:
+    x0, y0, x1, y1 = job["rect"]
+    prompt = f"""
+    Jsi procesní inženýr a expert na P&ID schémata dle normy ISA-5.1.
+    Zanalyzuj tento výřez P&ID výkresu ({job['label']}) a extrahuj znalostní graf.
+
+    PRAVIDLA:
+    1. Uzly (nodes): Všechna hlavní zařízení (equipment: nádrže, čerpadla, dmychadla, reaktory), armatury (valve: regulační i uzavírací ventily, zpětné klapky), přístroje (instrument: FT, PT, LT, LIC, FIC, LSLL, PI, TI...), odkazy na jiné listy (off_page) a vstupy/výstupy (boundary).
+    2. Souřadnice (box_2d): U každého uzlu vrať polohu symbolu/bubliny PŘÍMO NA TOMTO OBRÁZKU [ymin, xmin, ymax, xmax] v rozsahu 0 až 1000.
+    3. Hrany (edges): Propoj uzly podle skutečného vedení na výkrese:
+       - "flows_to": směr toku média v procesním potrubí
+       - "signal": řídicí nebo komunikační signál
+       - "measures": měřicí odběr snímače na nádrž/potrubí
+       - "interlock": bezpečnostní odstavení / blokace / trip
+    4. Ignoruj razítko výkresu a obecné textové poznámky mimo schéma.
+
+    Vrať VÝHRADNĚ validní JSON:
+    {{
+      "nodes": [
+        {{"id": "TK-100", "category": "equipment", "type": "Feed Tank", "line_spec": "", "description": "Vstupní nádrž", "page": {job['page']}, "box_2d": [210, 140, 490, 260]}}
+      ],
+      "edges": [
+        {{"source": "TK-100", "target": "P-101", "relation_type": "flows_to", "label": "4\\"-PW-001"}}
+      ]
+    }}{text_hint}
+    """
+
+    last_err = None
+    for model_name in models_to_try:
+        attempt_state = {"chars": 0, "text": "", "error": None, "done": False}
+        t0 = time.time()
+        th = threading.Thread(
+            target=_single_attempt_worker,
+            args=(api_client, model_name, job["jpeg"], prompt, attempt_state),
+            daemon=True,
+        )
+        th.start()
+
+        while th.is_alive():
+            elapsed = round(time.time() - t0, 1)
+            if elapsed > per_model_timeout:
+                last_err = TimeoutError(f"{model_name} neodpověděl do {int(per_model_timeout)} s.")
+                break
+            status_placeholder.info(
+                f"⏳ [{job_idx}/{total_jobs}] {job['label']} | model **{model_name}** | {elapsed} s / {int(per_model_timeout)} s | přijato {attempt_state['chars']} zn."
+            )
+            time.sleep(0.35)
+
+        if not attempt_state["done"]:
+            status_placeholder.warning(f"⚠️ {model_name} překročil {int(per_model_timeout)} s, přepínám na záložní model...")
+            continue
+
+        if attempt_state["error"]:
+            last_err = RuntimeError(attempt_state["error"])
+            status_placeholder.warning(f"⚠️ {model_name} vrátil chybu, zkouším další model...")
+            time.sleep(0.6)
+            continue
+
+        clean_json = re.sub(r"^```(?:json)?\s*|\s*```$", "", attempt_state["text"]).strip()
+        if not clean_json:
+            last_err = ValueError(f"{model_name} vrátil prázdnou odpověď.")
+            continue
+
+        parsed = PageExtractionResult.model_validate_json(clean_json)
+
+        # Přepočet lokálních souřadnic dlaždice [0..1000] na globální souřadnice celého listu [0..1000]
+        span_x = x1 - x0
+        span_y = y1 - y0
+        for n in parsed.nodes:
+            n.page = job["page"]
+            if n.box_2d and len(n.box_2d) == 4:
+                lymin, lxmin, lymax, lxmax = [max(0.0, min(1000.0, float(v))) for v in n.box_2d]
+                gymin = int(round((y0 + (lymin / 1000.0) * span_y) * 1000))
+                gxmin = int(round((x0 + (lxmin / 1000.0) * span_x) * 1000))
+                gymax = int(round((y0 + (lymax / 1000.0) * span_y) * 1000))
+                gxmax = int(round((x0 + (lxmax / 1000.0) * span_x) * 1000))
+                n.box_2d = [gymin, gxmin, gymax, gxmax]
+
+        return parsed, model_name
+
+    raise RuntimeError(f"Úloha '{job['label']}' selhala na všech modelech: {last_err}")
+
+
+def merge_extraction_results(results: list[PageExtractionResult]) -> PageExtractionResult:
+    """Sloučí uzly a hrany ze všech dlaždic do jediného čistého grafu bez duplicit."""
+    merged_nodes: dict[tuple[int, str], PIDNode] = {}
+    id_canonical: dict[str, str] = {}
+
+    for res in results:
+        for n in res.nodes:
+            clean_id = n.id.strip()
+            if not clean_id:
+                continue
+            norm_key = clean_id.upper()
+            canonical = id_canonical.setdefault(norm_key, clean_id)
+            n.id = canonical
+            map_key = (n.page, norm_key)
+
+            if map_key not in merged_nodes:
+                merged_nodes[map_key] = n
+            else:
+                existing = merged_nodes[map_key]
+                if not existing.box_2d and n.box_2d:
+                    existing.box_2d = n.box_2d
+                if len(n.description) > len(existing.description):
+                    existing.description = n.description
+                if not existing.line_spec and n.line_spec:
+                    existing.line_spec = n.line_spec
+
+    merged_edges: dict[tuple[str, str, str], PIDEdge] = {}
+    for res in results:
+        for e in res.edges:
+            s_norm = e.source.strip().upper()
+            t_norm = e.target.strip().upper()
+            if not s_norm or not t_norm or s_norm == t_norm:
+                continue
+            s_id = id_canonical.get(s_norm, e.source.strip())
+            t_id = id_canonical.get(t_norm, e.target.strip())
+            rel = e.relation_type.strip().lower() or "flows_to"
+            edge_key = (s_id.upper(), t_id.upper(), rel)
+            if edge_key not in merged_edges:
+                merged_edges[edge_key] = PIDEdge(
+                    source=s_id,
+                    target=t_id,
+                    relation_type=rel,
+                    label=e.label.strip(),
+                )
+            elif not merged_edges[edge_key].label and e.label.strip():
+                merged_edges[edge_key].label = e.label.strip()
+
+    return PageExtractionResult(
+        nodes=list(merged_nodes.values()),
+        edges=list(merged_edges.values()),
+    )
+
+
+# ==============================================================================
+# 5. ANALÝZA GRAFU (CONTROL LOOPS, QA CHYBY, DETERMINISTICKÉ TRASOVÁNÍ)
 # ==============================================================================
 def analyze_graph_metrics(nodes: list[PIDNode], edges: list[PIDEdge]) -> dict:
     node_map = {n.id: n for n in nodes}
@@ -200,12 +401,10 @@ def analyze_graph_metrics(nodes: list[PIDNode], edges: list[PIDEdge]) -> dict:
             adj_out[e.source].append(e)
             adj_in[e.target].append(e)
 
-    # Detekce izolovaných uzlů
     for n in nodes:
         if in_deg[n.id] == 0 and out_deg[n.id] == 0:
             qa_issues.append(f"Izolovaný prvek '{n.id}' ({n.type}) nemá žádné napojení.")
 
-    # Detekce regulačních smyček (Control Loops) dle ISA čísla smyčky nebo signálových řetězců
     loop_groups: dict[str, list[str]] = defaultdict(list)
     for n in nodes:
         if n.category in ("instrument", "valve"):
@@ -215,7 +414,6 @@ def analyze_graph_metrics(nodes: list[PIDNode], edges: list[PIDEdge]) -> dict:
 
     control_loops = {k: v for k, v in loop_groups.items() if len(v) >= 2}
 
-    # Pokud nebyly nalezeny dle číselného suffixu, spočítáme souvislé signálové cesty
     if not control_loops:
         sig_nodes = set()
         for e in valid_edges:
@@ -254,7 +452,6 @@ def analyze_graph_metrics(nodes: list[PIDNode], edges: list[PIDEdge]) -> dict:
 
 
 def trace_subgraph(metrics: dict, start_id: str, mode: str) -> tuple[list[str], list[list[str]], str]:
-    """Deterministické trasování po grafu pro okamžité zvýraznění bez čekání."""
     adj_out = metrics["adj_out"]
     adj_in = metrics["adj_in"]
     node_map = metrics["node_map"]
@@ -310,103 +507,6 @@ def trace_subgraph(metrics: dict, start_id: str, mode: str) -> tuple[list[str], 
 
 
 # ==============================================================================
-# 5. STREAMING WORKER PRO GEMINI API
-# ==============================================================================
-def stream_with_retry_worker(api_client, models_to_try: list[str], content_parts: list, prompt_text: str, fast_mode: bool, state: dict):
-    last_error = None
-
-    for model_name in models_to_try:
-        state["note"] = f"Zkouším {model_name}..."
-        state["chars"] = 0
-        state["thoughts"] = 0
-        cfg_kwargs = {
-            "response_mime_type": "application/json",
-            "temperature": 0.1,
-            "max_output_tokens": 8192,
-        }
-        if fast_mode:
-            try:
-                cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level="LOW")
-            except Exception:
-                pass
-
-        try:
-            t_model_start = time.time()
-            stream = api_client.models.generate_content_stream(
-                model=model_name,
-                contents=[*content_parts, prompt_text],
-                config=types.GenerateContentConfig(**cfg_kwargs),
-            )
-            chunks = []
-            aborted_slow = False
-            for chunk in stream:
-                if state["chars"] == 0 and state["thoughts"] == 0 and (time.time() - t_model_start) > 28:
-                    aborted_slow = True
-                    last_error = TimeoutError(f"{model_name} neodpověděl do 28 s.")
-                    break
-
-                got_part_text = False
-                candidates = getattr(chunk, "candidates", None) or []
-                for cand in candidates:
-                    content = getattr(cand, "content", None)
-                    parts = getattr(content, "parts", None) or []
-                    for p in parts:
-                        p_text = getattr(p, "text", None) or ""
-                        if getattr(p, "thought", False):
-                            state["thoughts"] += len(p_text)
-                        elif p_text:
-                            chunks.append(p_text)
-                            state["chars"] += len(p_text)
-                            got_part_text = True
-
-                if not got_part_text and getattr(chunk, "text", None):
-                    chunks.append(chunk.text)
-                    state["chars"] += len(chunk.text)
-
-            if aborted_slow:
-                state["note"] = f"{model_name} neodpovídá, přepínám..."
-                continue
-
-            result_text = "".join(chunks).strip()
-            if result_text:
-                state["text"] = result_text
-                state["used_model"] = model_name
-                state["done"] = True
-                return
-        except Exception as exc:
-            last_error = exc
-            err_str = str(exc)
-            if "thinking" in err_str.lower() and "thinking_config" in cfg_kwargs:
-                del cfg_kwargs["thinking_config"]
-                try:
-                    stream = api_client.models.generate_content_stream(
-                        model=model_name,
-                        contents=[*content_parts, prompt_text],
-                        config=types.GenerateContentConfig(**cfg_kwargs),
-                    )
-                    chunks = []
-                    for chunk in stream:
-                        if getattr(chunk, "text", None):
-                            chunks.append(chunk.text)
-                            state["chars"] += len(chunk.text)
-                    result_text = "".join(chunks).strip()
-                    if result_text:
-                        state["text"] = result_text
-                        state["used_model"] = model_name
-                        state["done"] = True
-                        return
-                except Exception as exc2:
-                    last_error = exc2
-
-            state["note"] = f"{model_name} nedostupný, zkouším další..."
-            time.sleep(1)
-            continue
-
-    state["error"] = str(last_error) if last_error else "Nepodařilo se získat odpověď z žádného modelu."
-    state["done"] = True
-
-
-# ==============================================================================
 # 6. INTERAKTIVNÍ PROSTOROVÝ CANVAS OVERLAY (HTML5 + SVG)
 # ==============================================================================
 def render_spatial_kg_component(
@@ -426,7 +526,6 @@ def render_spatial_kg_component(
     bg_bytes = encode_jpeg_bytes(base_img, max_px=1800, quality=82)
     bg_b64 = base64.b64encode(bg_bytes).decode("ascii")
 
-    # Vypočítáme normalizované středy [0..1000] a boxy [ymin, xmin, ymax, xmax]
     prepared_nodes = []
     coord_source_map = {}
     valid_ids = set()
@@ -438,7 +537,6 @@ def render_spatial_kg_component(
         box = None
         if clean_key in pdf_word_boxes:
             nx0, ny0, nx1, ny1 = pdf_word_boxes[clean_key]
-            # Mírně zvětšíme box kolem textu TAGu, aby odpovídal symbolu/bublině
             pad_x = 12
             pad_y = 14
             ymin = max(0, int(ny0 * 1000) - pad_y)
@@ -482,7 +580,6 @@ def render_spatial_kg_component(
     payload = {
         "imgW": w,
         "imgH": h,
-        "bgB64": bg_b64,
         "nodes": prepared_nodes,
         "edges": prepared_edges,
         "hlNodes": highlighted_nodes,
@@ -683,7 +780,6 @@ function renderOverlay() {{
     </marker>
   </defs>`;
 
-  // 1. Ohraničení detekovaných symbolů (bounding boxes)
   if (DATA.showBoxes) {{
     DATA.nodes.forEach(n => {{
       const [ymin, xmin, ymax, xmax] = n.box;
@@ -699,7 +795,6 @@ function renderOverlay() {{
     }});
   }}
 
-  // 2. Hrany znalostního grafu přímo mezi souřadnicemi na výkrese
   if (DATA.showGraph) {{
     DATA.edges.forEach(e => {{
       const s = nodeMap[e.source];
@@ -713,7 +808,6 @@ function renderOverlay() {{
       const dist = Math.hypot(dx, dy);
       if (dist < 4) return;
 
-      // Zkrátíme konec o poloměr cílového uzlu, aby šipka nelezla pod kruh
       const pad = nodeR + 4;
       const tx = x2 - (dx / dist) * pad;
       const ty = y2 - (dy / dist) * pad;
@@ -738,7 +832,6 @@ function renderOverlay() {{
       }}
     }});
 
-    // 3. Uzly a TAG štítky na souřadnicích výkresu
     DATA.nodes.forEach(n => {{
       const cx = (n.cx / 1000) * W;
       const cy = (n.cy / 1000) * H;
@@ -775,7 +868,6 @@ function selectNode(nid) {{
   renderOverlay();
 }}
 
-// Pan & Zoom myší i dotykem na mobilu
 let isDragging = false, startX = 0, startY = 0;
 viewport.addEventListener('pointerdown', e => {{
   if (e.target.tagName === 'circle' || e.target.tagName === 'text') return;
@@ -820,8 +912,8 @@ with c_top1:
 with c_top2:
     scan_mode = st.radio(
         "Režim čtení výkresu",
-        ["⚡ Rychlý průchod (1 celek, ~15 s)", "🔬 Dlaždicový sken (Tile-by-Tile 2×2, detailní)"],
-        index=0,
+        ["⚡ Rychlý průchod (1 celek, ~15 s)", "🔬 Dlaždicový sken (Tile-by-Tile 2×2)"],
+        index=1,
         horizontal=True
     )
 
@@ -892,7 +984,9 @@ if raw_bytes is not None:
 
             page_txt = " ".join(page.get_text("text").split())
             if page_txt:
-                extracted_text_hints.append(f"[Strana {idx_sel} - {label}]: {page_txt[:2600]}")
+                extracted_text_hints.append(f"\nTextová vrstva z PDF (nápověda TAGů):\n{page_txt[:2400]}")
+            else:
+                extracted_text_hints.append("")
 
             pix = page.get_pixmap(dpi=180)
             raw_img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
@@ -902,6 +996,7 @@ if raw_bytes is not None:
         hd_images = [raw_img]
         selected_labels = ["Načtený výkres"]
         pdf_word_boxes_per_page = [{}]
+        extracted_text_hints = [""]
 
 if hd_images:
     if st.button(
@@ -913,88 +1008,53 @@ if hd_images:
         tile_mode = scan_mode.startswith("🔬")
         with st.status("Skenuji výkres a sestavuji prostorový graf...", expanded=True) as status:
             try:
-                content_parts = []
+                all_jobs = []
+                job_hints = []
                 for idx_p, img in enumerate(hd_images, start=1):
-                    content_parts.extend(build_image_parts_with_tiles(img, page_num=idx_p, tile_mode=tile_mode))
+                    p_jobs = create_tile_jobs(img, page_num=idx_p, tile_mode=tile_mode)
+                    all_jobs.extend(p_jobs)
+                    hint_for_page = extracted_text_hints[idx_p - 1] if idx_p - 1 < len(extracted_text_hints) else ""
+                    job_hints.extend([hint_for_page] * len(p_jobs))
 
-                timer_box = st.empty()
-                hints_block = ""
-                if extracted_text_hints:
-                    hints_block = "\nTextová vrstva z PDF (ověřené TAGy na listu):\n" + "\n".join(extracted_text_hints)
-
-                prompt = f"""
-                Jsi špičkový procesní inženýr a expert na P&ID schémata dle normy ISA-5.1.
-                Zanalyzuj přiložený výkres a sestav přesný prostorový znalostní graf (Knowledge Graph).
-
-                PRAVIDLA EXTRAKCE:
-                1. Uzly (nodes): Extrahuj všechna hlavní zařízení (equipment: nádrže, čerpadla, dmychadla, reaktory), armatury (valve: regulační i uzavírací ventily, zpětné klapky), přístroje a snímače (instrument: FT, PT, LT, LIC, FIC, LSLL, PI, TI...), odkazy na jiné listy (off_page) a vstupy/výstupy procesu (boundary).
-                2. Souřadnice (box_2d): U KAŽDÉHO uzlu vrať přesné souřadnice jeho symbolu/bubliny na celém listu [ymin, xmin, ymax, xmax] v měřítku 0 až 1000.
-                3. Hrany (edges): Propoj uzly podle skutečného vedení na výkrese a rozliš přesně typ vazby ("relation_type"):
-                   - "flows_to": směr toku média v procesním potrubí (např. TK-100 -> P-101 -> FT-101 -> FV-101 -> off_page).
-                   - "signal": řídicí nebo komunikační signál mezi přístroji a akčními členy (např. LT-200 -> LIC-200 -> FIC-101 -> FV-101).
-                   - "measures": měřicí napojení snímače/manometru na nádrž nebo potrubí (např. PI-102 -> P-101 nebo LT-200 -> TK-100).
-                   - "interlock": bezpečnostní odstavení / blokace / trip (např. LSLL-201 -> P-101).
-                4. Ignoruj texty v razítku výkresu a obecné poznámky mimo schéma.
-
-                Vrať VÝHRADNĚ validní JSON v této struktuře:
-                {{
-                  "nodes": [
-                    {{"id": "TK-100", "category": "equipment", "type": "Feed Tank", "line_spec": "", "description": "Vstupní akumulační nádrž", "page": 1, "box_2d": [210, 140, 490, 260]}}
-                  ],
-                  "edges": [
-                    {{"source": "TK-100", "target": "P-101", "relation_type": "flows_to", "label": "4\\"-PW-001"}}
-                  ]
-                }}{hints_block}
-                """
-
-                fast_mode = not tile_mode
-                max_wait = 120
                 models_queue = [model_choice] + [m for m in available_models if m != model_choice][:3]
-                worker_state = {"chars": 0, "thoughts": 0, "note": "", "text": "", "used_model": model_choice, "error": None, "done": False}
+                tile_results: list[PageExtractionResult] = []
+                used_models_set = set()
+                progress_box = st.empty()
 
-                thread = threading.Thread(
-                    target=stream_with_retry_worker,
-                    args=(client, models_queue, content_parts, prompt, fast_mode, worker_state),
-                    daemon=True,
-                )
-                thread.start()
-
-                while not worker_state["done"]:
-                    elapsed_now = round(time.time() - t_start, 1)
-                    if elapsed_now > max_wait:
-                        raise TimeoutError(f"API neodpovědělo do {max_wait} s.")
-                    extra = f" | {worker_state['note']}" if worker_state["note"] else ""
-                    timer_box.info(
-                        f"⏳ Extrahuji symboly a topologii... {elapsed_now} s / {max_wait} s | přijato {worker_state['chars']} zn.{extra}"
+                for j_idx, (job, hint_txt) in enumerate(zip(all_jobs, job_hints), start=1):
+                    res_part, used_m = run_tile_with_hard_timeout(
+                        api_client=client,
+                        models_to_try=models_queue,
+                        job=job,
+                        text_hint=hint_txt,
+                        status_placeholder=progress_box,
+                        job_idx=j_idx,
+                        total_jobs=len(all_jobs),
+                        per_model_timeout=32.0,
                     )
-                    time.sleep(0.4)
+                    tile_results.append(res_part)
+                    used_models_set.add(used_m)
+                    st.write(f"✅ **{job['label']}** hotovo ({len(res_part.nodes)} prvků, {len(res_part.edges)} vazeb | {used_m})")
 
-                if worker_state["error"]:
-                    raise RuntimeError(worker_state["error"])
-
-                clean_json = re.sub(r"^```(?:json)?\s*|\s*```$", "", worker_state["text"].strip())
-                if not clean_json:
-                    raise ValueError("Model vrátil prázdnou odpověď.")
-
-                elapsed = round(time.time() - t_start, 1)
-                timer_box.empty()
-
-                extracted_data = PageExtractionResult.model_validate_json(clean_json)
+                progress_box.empty()
+                extracted_data = merge_extraction_results(tile_results)
                 metrics = analyze_graph_metrics(extracted_data.nodes, extracted_data.edges)
+                elapsed = round(time.time() - t_start, 1)
+                used_models_str = ", ".join(sorted(used_models_set))
 
                 st.session_state["pid_kg"] = {
                     "data": extracted_data,
                     "metrics": metrics,
-                    "raw_json": clean_json,
+                    "raw_json": extracted_data.model_dump_json(indent=2),
                     "labels": selected_labels,
                     "elapsed": elapsed,
-                    "model": worker_state["used_model"],
+                    "model": used_models_str,
                     "hl_nodes": [],
                     "hl_edges": [],
                     "qa_answer": None,
                 }
                 status.update(
-                    label=f"Hotovo za {elapsed} s ({worker_state['used_model']}) — {len(extracted_data.nodes)} uzlů, {len(metrics['valid_edges'])} hran",
+                    label=f"Hotovo za {elapsed} s ({used_models_str}) — {len(extracted_data.nodes)} uzlů, {len(metrics['valid_edges'])} hran",
                     state="complete",
                     expanded=False
                 )
@@ -1013,7 +1073,6 @@ if "pid_kg" in st.session_state:
     metrics: dict = kg["metrics"]
     saved_labels: list[str] = kg["labels"]
 
-    # KPI lišta jako ve videu (Nodes | Edges | Control Loops | QA Errors)
     k1, k2, k3, k4 = st.columns(4)
     with k1:
         st.markdown(f'<div class="kpi-card"><div class="kpi-val">{len(extracted_data.nodes)}</div><div class="kpi-lbl">Nodes (Prvky)</div></div>', unsafe_allow_html=True)
@@ -1028,7 +1087,6 @@ if "pid_kg" in st.session_state:
 
     st.write("")
 
-    # Přepínače zobrazení prostorového grafu
     v1, v2, v3, v4 = st.columns(4)
     with v1:
         dark_bp = st.checkbox("Tmavý Blueprint režim", value=True)
@@ -1039,7 +1097,6 @@ if "pid_kg" in st.session_state:
     with v4:
         show_edge_lbl = st.checkbox("Popisky hran", value=False)
 
-    # Hlavní prostorový overlay přímo nad výkresem
     all_coord_sources = {}
     if len(hd_images) == len(saved_labels) and len(hd_images) > 0:
         if len(hd_images) == 1:
@@ -1075,9 +1132,6 @@ if "pid_kg" in st.session_state:
                     )
                     all_coord_sources.update(src_map)
 
-    # ==========================================================================
-    # ASK THE GRAPH — Interaktivní trasování a zvýraznění cesty ve výkrese
-    # ==========================================================================
     st.subheader("🔎 Ask the Graph (Trasování procesu a smyček přímo ve výkrese)")
 
     node_ids_list = [n.id for n in extracted_data.nodes]
@@ -1160,9 +1214,6 @@ if "pid_kg" in st.session_state:
             kg["qa_answer"] = None
             st.rerun()
 
-    # ==========================================================================
-    # DETAILNÍ TABULKY, REGULAČNÍ SMYČKY, QA KONTROLA A EXPORT
-    # ==========================================================================
     t_nodes, t_edges, t_loops, t_qa = st.tabs([
         f"Prvky ({len(extracted_data.nodes)})",
         f"Vazby ({len(metrics['valid_edges'])})",
