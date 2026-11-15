@@ -44,19 +44,13 @@ def get_gemini_client():
 
 client = get_gemini_client()
 
-def convert_pdf_to_image(pdf_bytes: bytes) -> Image.Image:
-    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-    page = doc.load_page(0)
-    pix = page.get_pixmap(dpi=300)
-    return Image.open(io.BytesIO(pix.tobytes("png")))
-
 def load_from_url(url: str) -> tuple[bytes, str]:
     drive_match = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url) or re.search(r"[?&]id=([a-zA-Z0-9_-]+)", url)
     if drive_match:
         file_id = drive_match.group(1)
         url = f"https://drive.google.com/uc?export=download&id={file_id}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    with urllib.request.urlopen(req, timeout=25) as resp:
         content_type = resp.headers.get_content_type()
         data = resp.read()
         if "text/html" in content_type.lower():
@@ -75,7 +69,8 @@ zdroj = st.radio(
     horizontal=False
 )
 
-image = None
+raw_bytes = None
+is_pdf = False
 
 if zdroj == "🔗 Odkaz (Google Disk / URL)":
     file_url = st.text_input("Vložte sdílený odkaz na JPG/PNG/PDF")
@@ -83,44 +78,70 @@ if zdroj == "🔗 Odkaz (Google Disk / URL)":
         try:
             with st.spinner("Stahuji výkres z odkazu..."):
                 raw_bytes, content_type = load_from_url(file_url.strip())
-                if "pdf" in content_type.lower() or raw_bytes[:4] == b"%PDF":
-                    image = convert_pdf_to_image(raw_bytes)
-                else:
-                    image = Image.open(io.BytesIO(raw_bytes))
-                st.info(f"Výkres úspěšně stažen ({round(len(raw_bytes) / 1024, 1)} KB)")
+                is_pdf = "pdf" in content_type.lower() or raw_bytes[:4] == b"%PDF"
+                st.info(f"Výkres stažen ({round(len(raw_bytes) / 1024, 1)} KB)")
         except Exception as e:
             st.error(f"Nepodařilo se načíst soubor z odkazu: {e}")
 
 elif zdroj == "📷 Vyfotit kamerou":
     cam_file = st.camera_input("Vyfoťte P&ID schéma")
     if cam_file is not None:
-        st.info(f"Načten snímek z kamery ({round(cam_file.size / 1024, 1)} KB)")
-        image = Image.open(cam_file)
+        raw_bytes = cam_file.getvalue()
+        st.info(f"Načten snímek z kamery ({round(len(raw_bytes) / 1024, 1)} KB)")
 
 else:
     uploaded_file = st.file_uploader("Nahrajte P&ID výkres (PDF, PNG, JPG)")
     if uploaded_file is not None:
-        st.info(f"Načten soubor: {uploaded_file.name} ({round(uploaded_file.size / 1024, 1)} KB)")
-        if uploaded_file.type == "application/pdf" or uploaded_file.name.lower().endswith(".pdf"):
-            image = convert_pdf_to_image(uploaded_file.getvalue())
-        else:
-            image = Image.open(uploaded_file)
+        raw_bytes = uploaded_file.getvalue()
+        is_pdf = uploaded_file.type == "application/pdf" or uploaded_file.name.lower().endswith(".pdf")
+        st.info(f"Načten soubor: {uploaded_file.name} ({round(len(raw_bytes) / 1024, 1)} KB)")
 
-if image is not None:
-    st.image(image, caption="Načtený výkres")
+images = []
+selected_labels = []
 
-    if st.button("🔍 Analyzovat a vygenerovat graf", type="primary"):
+if raw_bytes is not None:
+    if is_pdf:
+        doc = pymupdf.open(stream=raw_bytes, filetype="pdf")
+        total_pages = len(doc)
+        st.write(f"📄 **Počet stran v PDF:** {total_pages}")
+
+        page_options = [f"Strana {i + 1}" for i in range(total_pages)]
+        selected_labels = st.multiselect(
+            "Vyberte strany k náhledu a analýze",
+            options=page_options,
+            default=page_options
+        )
+
+        for label in selected_labels:
+            page_idx = page_options.index(label)
+            pix = doc.load_page(page_idx).get_pixmap(dpi=220)
+            images.append(Image.open(io.BytesIO(pix.tobytes("png"))))
+    else:
+        images = [Image.open(io.BytesIO(raw_bytes))]
+        selected_labels = ["Načtený výkres"]
+
+if images:
+    if len(images) == 1:
+        st.image(images[0], caption=selected_labels[0])
+    else:
+        tabs = st.tabs(selected_labels)
+        for tab, img, lbl in zip(tabs, images, selected_labels):
+            with tab:
+                st.image(img, caption=lbl)
+
+    if st.button(f"🔍 Analyzovat ({len(images)} {'stranu' if len(images) == 1 else 'strany/stran'}) a vygenerovat graf", type="primary"):
         with st.spinner("Gemini čte technické schéma a sestavuje graf prvků..."):
             try:
                 prompt = """
-                Jsi expert na P&ID schémata. Zanalyzuj tento výkres podle normy ISA-5.1.
-                Extrahuj všechny uzly (Equipment, Valves, Instruments) a jejich propojení (Piping, Signal lines).
+                Jsi expert na P&ID schémata. Zanalyzuj všechny přiložené strany výkresu podle normy ISA-5.1.
+                Extrahuj všechny uzly (Equipment, Valves, Instruments) a jejich propojení (Piping, Signal lines)
+                napříč všemi stranami do jednoho sjednoceného znalostního grafu (propoj i návaznosti mezi listy / Off-Page Connectors).
                 U každého prvku uveď přesný TAG kód (např. PT-101, V-102, T-100).
                 """
 
                 response = client.models.generate_content(
                     model=model_choice,
-                    contents=[image, prompt],
+                    contents=[*images, prompt],
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
                         response_schema=PageExtractionResult,
@@ -132,12 +153,18 @@ if image is not None:
                 st.success(f"Extrakce dokončena! Nalezeno {len(extracted_data.nodes)} prvků a {len(extracted_data.edges)} propojení.")
 
                 net = Network(height="500px", width="100%", directed=True, bgcolor="#1e1e1e", font_color="white")
+                known_ids = set()
 
                 for node in extracted_data.nodes:
+                    known_ids.add(node.id)
                     node_color = "#4CAF50" if node.category == "equipment" else "#2196F3" if node.category == "instrument" else "#FF9800"
                     net.add_node(node.id, label=f"{node.id}\n({node.type})", title=node.description, color=node_color)
 
                 for edge in extracted_data.edges:
+                    for endpoint in (edge.source, edge.target):
+                        if endpoint not in known_ids:
+                            known_ids.add(endpoint)
+                            net.add_node(endpoint, label=endpoint, title="Odkazovaný prvek / Off-page connector", color="#9E9E9E")
                     net.add_edge(edge.source, edge.target, label=edge.relation_type)
 
                 net.toggle_physics(True)
@@ -155,17 +182,7 @@ if image is not None:
                     )
 
                 with col2:
-                    cypher_lines = [f"CREATE (:Component {{id: '{n.id}', type: '{n.type}'}});" for n in extracted_data.nodes]
-                    cypher_lines += [
-                        f"MATCH (a:Component {{id: '{e.source}'}}), (b:Component {{id: '{e.target}'}}) CREATE (a)-[:{e.relation_type.upper().replace(' ', '_').replace('-', '_')}]->(b);"
-                        for e in extracted_data.edges
-                    ]
-                    st.download_button(
-                        label="Stáhnout Cypher",
-                        data="\n".join(cypher_lines),
-                        file_name="pid_graph.cypher",
-                        mime="text/plain"
-                    )
-
-            except Exception as e:
-                st.error(f"Chyba při zpracování: {str(e)}")
+                    cypher_lines = []
+                    for n in extracted_data.nodes:
+                        n_id = n.id.replace("'", "")
+                        n_type = n
