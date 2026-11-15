@@ -100,22 +100,25 @@ client = get_gemini_client()
 
 @st.cache_data(ttl=3600)
 def get_available_models(_client) -> list[str]:
-    preferred = ["gemini-3.5-flash", "gemini-3.8-flash", "gemini-3.5-pro", "gemini-2.5-pro", "gemini-2.5-flash-lite"]
+    preferred = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.5-pro", "gemini-3.8-flash"]
     if _client is None:
-        return ["gemini-3.5-flash"]
+        return preferred
     found = []
     try:
         for m in _client.models.list():
             name = getattr(m, "name", "") or ""
             short_name = name.replace("models/", "")
             actions = getattr(m, "supported_actions", None) or []
-            if "gemini" in short_name and not any(x in short_name for x in ("embedding", "imagen", "veo", "aqa", "tts", "live")):
+            if (
+                "gemini" in short_name
+                and not any(x in short_name for x in ("2.0", "2.5", "embedding", "imagen", "veo", "aqa", "tts", "live", "robotics", "computer-use"))
+            ):
                 if not actions or "generateContent" in actions:
                     found.append(short_name)
     except Exception:
         pass
     if not found:
-        return ["gemini-3.5-flash"]
+        return preferred
     ordered = [p for p in preferred if p in found]
     others = [f for f in found if f not in ordered]
     return ordered + others
@@ -151,7 +154,6 @@ def encode_jpeg_bytes(img: Image.Image, max_px: int = 1500, quality: int = 82) -
 
 
 def create_tile_jobs(img: Image.Image, page_num: int, tile_mode: bool) -> list[dict]:
-    """Vytvoří seznam samostatných úloh (každá má 1 obrázek + přesné normované okno na listu)."""
     if not tile_mode:
         return [{
             "label": f"Strana {page_num} (celek)",
@@ -161,7 +163,6 @@ def create_tile_jobs(img: Image.Image, page_num: int, tile_mode: bool) -> list[d
         }]
 
     w, h = img.size
-    # 4 překrývající se kvadranty (15% překryv uprostřed, aby se neztratily hrany přes střed)
     quads = [
         ("Dlaždice 1/4 (levá horní)", (0.0, 0.0, 0.575, 0.575)),
         ("Dlaždice 2/4 (pravá horní)", (0.425, 0.0, 1.0, 0.575)),
@@ -239,7 +240,7 @@ def run_tile_with_hard_timeout(
     status_placeholder,
     job_idx: int,
     total_jobs: int,
-    per_model_timeout: float = 32.0,
+    per_model_timeout: float = 42.0,
 ) -> tuple[PageExtractionResult, str]:
     x0, y0, x1, y1 = job["rect"]
     prompt = f"""
@@ -267,8 +268,14 @@ def run_tile_with_hard_timeout(
     }}{text_hint}
     """
 
+    # Hlavní model zkusíme 2x (kvůli RPM limitu), pak záložní modely řady 3.x
+    attempt_plan = [models_to_try[0], models_to_try[0]] + models_to_try[1:]
+
     last_err = None
-    for model_name in models_to_try:
+    for idx_try, model_name in enumerate(attempt_plan):
+        if idx_try == 1:
+            time.sleep(2.0)
+
         attempt_state = {"chars": 0, "text": "", "error": None, "done": False}
         t0 = time.time()
         th = threading.Thread(
@@ -289,13 +296,13 @@ def run_tile_with_hard_timeout(
             time.sleep(0.35)
 
         if not attempt_state["done"]:
-            status_placeholder.warning(f"⚠️ {model_name} překročil {int(per_model_timeout)} s, přepínám na záložní model...")
+            status_placeholder.warning(f"⚠️ {model_name} překročil {int(per_model_timeout)} s, zkouším další pokus...")
             continue
 
         if attempt_state["error"]:
             last_err = RuntimeError(attempt_state["error"])
             status_placeholder.warning(f"⚠️ {model_name} vrátil chybu, zkouším další model...")
-            time.sleep(0.6)
+            time.sleep(1.0)
             continue
 
         clean_json = re.sub(r"^```(?:json)?\s*|\s*```$", "", attempt_state["text"]).strip()
@@ -303,9 +310,12 @@ def run_tile_with_hard_timeout(
             last_err = ValueError(f"{model_name} vrátil prázdnou odpověď.")
             continue
 
-        parsed = PageExtractionResult.model_validate_json(clean_json)
+        try:
+            parsed = PageExtractionResult.model_validate_json(clean_json)
+        except Exception as parse_err:
+            last_err = parse_err
+            continue
 
-        # Přepočet lokálních souřadnic dlaždice [0..1000] na globální souřadnice celého listu [0..1000]
         span_x = x1 - x0
         span_y = y1 - y0
         for n in parsed.nodes:
@@ -320,11 +330,10 @@ def run_tile_with_hard_timeout(
 
         return parsed, model_name
 
-    raise RuntimeError(f"Úloha '{job['label']}' selhala na všech modelech: {last_err}")
+    raise RuntimeError(f"Úloha '{job['label']}' selhala: {last_err}")
 
 
 def merge_extraction_results(results: list[PageExtractionResult]) -> PageExtractionResult:
-    """Sloučí uzly a hrany ze všech dlaždic do jediného čistého grafu bez duplicit."""
     merged_nodes: dict[tuple[int, str], PIDNode] = {}
     id_canonical: dict[str, str] = {}
 
@@ -1022,19 +1031,25 @@ if hd_images:
                 progress_box = st.empty()
 
                 for j_idx, (job, hint_txt) in enumerate(zip(all_jobs, job_hints), start=1):
-                    res_part, used_m = run_tile_with_hard_timeout(
-                        api_client=client,
-                        models_to_try=models_queue,
-                        job=job,
-                        text_hint=hint_txt,
-                        status_placeholder=progress_box,
-                        job_idx=j_idx,
-                        total_jobs=len(all_jobs),
-                        per_model_timeout=32.0,
-                    )
-                    tile_results.append(res_part)
-                    used_models_set.add(used_m)
-                    st.write(f"✅ **{job['label']}** hotovo ({len(res_part.nodes)} prvků, {len(res_part.edges)} vazeb | {used_m})")
+                    try:
+                        res_part, used_m = run_tile_with_hard_timeout(
+                            api_client=client,
+                            models_to_try=models_queue,
+                            job=job,
+                            text_hint=hint_txt,
+                            status_placeholder=progress_box,
+                            job_idx=j_idx,
+                            total_jobs=len(all_jobs),
+                            per_model_timeout=42.0,
+                        )
+                        tile_results.append(res_part)
+                        used_models_set.add(used_m)
+                        st.write(f"✅ **{job['label']}** hotovo ({len(res_part.nodes)} prvků, {len(res_part.edges)} vazeb | {used_m})")
+                    except Exception as tile_err:
+                        if tile_results:
+                            st.warning(f"⚠️ **{job['label']}** přeskočena ({tile_err}), pokračuji se zpracovanými částmi.")
+                        else:
+                            raise tile_err
 
                 progress_box.empty()
                 extracted_data = merge_extraction_results(tile_results)
